@@ -29,3 +29,7 @@ The timing window gets smaller with each consecutive hit!
 ├── js/game.js      # Game logic
 └── assets/         # Images and audio
 ```
+
+---
+
+**Disclaimer:** All game assets (images and audio) are the intellectual property of Nintendo and are used here for educational and demonstration purposes only. This is not a commercial project.
