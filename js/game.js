@@ -1,0 +1,816 @@
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const GW = 960;
+const GH = 540;
+canvas.width = GW;
+canvas.height = GH;
+
+const assets = {};
+const imageList = [
+  ['theatre', 'assets/paper-mario-theatre.jpg'],
+  ['mario', 'assets/paper-mario-spritesheet-mario.png'],
+  ['goomba', 'assets/paper-mario-enemy-family-goomba.png'],
+  ['badge', 'assets/paper-mario-badge-power-bounce.png'],
+];
+const audioAssets = {};
+const audioList = [
+  ['sfxEnemyHit', 'assets/paper-mario-enemy-hit.wav'],
+  ['sfxEnemyDeath', 'assets/paper-mario-enemy-death.wav'],
+];
+
+let totalAssets = imageList.length + audioList.length;
+let assetsLoaded = 0;
+function onAssetLoad(cb) { assetsLoaded++; if (assetsLoaded === totalAssets) cb(); }
+
+function loadAssets(cb) {
+  imageList.forEach(([name, src]) => {
+    const img = new Image();
+    img.onload = () => onAssetLoad(cb);
+    img.src = src;
+    assets[name] = img;
+  });
+  audioList.forEach(([name, src]) => {
+    const audio = new Audio(src);
+    audio.preload = 'auto';
+    audio.addEventListener('canplaythrough', () => onAssetLoad(cb), { once: true });
+    audioAssets[name] = audio;
+  });
+}
+
+const spriteCache = {};
+
+function extractSprite(img, sx, sy, sw, sh, bgCheck) {
+  const key = `${img.src}_${sx}_${sy}_${sw}_${sh}`;
+  if (spriteCache[key]) return spriteCache[key];
+
+  const c = document.createElement('canvas');
+  c.width = sw; c.height = sh;
+  const cx = c.getContext('2d');
+  cx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+
+  const id = cx.getImageData(0, 0, sw, sh);
+  const d = id.data;
+  for (let i = 0; i < d.length; i += 4) {
+    if (bgCheck(d[i], d[i+1], d[i+2])) {
+      d[i+3] = 0;
+    }
+  }
+  cx.putImageData(id, 0, 0);
+  spriteCache[key] = c;
+  return c;
+}
+
+function isMagenta(r, g, b) { return r > 230 && g < 30 && b > 230; }
+function isBlue(r, g, b) { return r < 80 && g > 100 && b > 200; }
+
+const MARIO_SPRITES = {
+  idle:    { x: 40,  y: 25,  w: 100, h: 166 },
+  run:     { x: 202, y: 67,  w: 115, h: 124 },
+  jump:    { x: 391, y: 28,  w: 127, h: 136 },
+  back:    { x: 943, y: 25,  w: 103, h: 166 },
+};
+
+const GOOMBA_SPRITE = { x: 6, y: 280, w: 88, h: 104 };
+
+let audioCtx;
+function initAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function playTone(freq, dur, type = 'square', vol = 0.15) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + dur);
+}
+
+function sfxJump() { playTone(520, 0.15); setTimeout(() => playTone(680, 0.12), 60); }
+function sfxHit() { if (audioAssets.sfxEnemyHit) { audioAssets.sfxEnemyHit.currentTime = 0; audioAssets.sfxEnemyHit.play(); } }
+function sfxBounce() { playTone(440, 0.1); setTimeout(() => playTone(660, 0.1), 50); setTimeout(() => playTone(880, 0.12), 100); }
+function sfxMiss() { if (audioAssets.sfxEnemyDeath) { audioAssets.sfxEnemyDeath.currentTime = 0; audioAssets.sfxEnemyDeath.play(); } }
+function sfxNice() { playTone(784, 0.1); setTimeout(() => playTone(988, 0.1), 80); setTimeout(() => playTone(1175, 0.15), 160); }
+function sfxStart() { playTone(440, 0.1); setTimeout(() => playTone(554, 0.1), 100); setTimeout(() => playTone(659, 0.15), 200); }
+
+const STATE = {
+  TITLE: 0,
+  IDLE: 1,
+  RUN_TO_ENEMY: 2,
+  JUMP_UP: 3,
+  FALL_TO_STOMP: 4,
+  ACTION_WINDOW: 5,
+  STOMP_HIT: 6,
+  BOUNCE_UP: 7,
+  BOUNCE_FALL: 8,
+  MISS_BOUNCE: 9,
+  MISS_FALL: 10,
+  RESULTS: 11,
+};
+
+let state = STATE.TITLE;
+let stateTimer = 0;
+
+const STAGE_FLOOR_Y = 445;
+const MARIO_START_X = 220;
+const GOOMBA_X = 560;
+const MARIO_SCALE = 0.45;
+const GOOMBA_SCALE = 0.6;
+
+let mario = { x: MARIO_START_X, y: STAGE_FLOOR_Y, sprite: 'idle', scaleX: -1 };
+let goomba = { x: GOOMBA_X, y: STAGE_FLOOR_Y, squish: 0, hp: 999, flash: 0 };
+
+let combo = 0;
+let totalDamage = 0;
+let bounceHeight = 0;
+let jumpVelY = 0;
+let jumpVelX = 0;
+
+let actionWindowStart = 0;
+let actionWindowDuration = 300;
+let actionPressed = false;
+let actionResult = '';
+
+const BASE_WINDOW = 320;
+const WINDOW_DECREASE = 18;
+const MIN_WINDOW = 75;
+
+let particles = [];
+let floatingTexts = [];
+let screenShake = { x: 0, y: 0, intensity: 0 };
+let starSparkles = [];
+
+let ringProgress = 0;
+let ringActive = false;
+
+let titleBounce = 0;
+
+let inputPressed = false;
+let inputJustPressed = false;
+
+function onInput() {
+  initAudio();
+  if (!inputPressed) {
+    inputPressed = true;
+    inputJustPressed = true;
+  }
+}
+
+function resetInput() {
+  inputJustPressed = false;
+}
+
+function onInputUp() {
+  inputPressed = false;
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'KeyA') { e.preventDefault(); onInput(); }
+});
+document.addEventListener('keyup', (e) => {
+  if (e.code === 'Space' || e.code === 'KeyA') onInputUp();
+});
+canvas.addEventListener('mousedown', onInput);
+canvas.addEventListener('mouseup', onInputUp);
+canvas.addEventListener('touchstart', (e) => { e.preventDefault(); onInput(); });
+canvas.addEventListener('touchend', onInputUp);
+
+function spawnStars(x, y, count = 5) {
+  for (let i = 0; i < count; i++) {
+    const angle = (Math.PI * 2 / count) * i + Math.random() * 0.5;
+    const speed = 2 + Math.random() * 3;
+    starSparkles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 2,
+      life: 1,
+      size: 3 + Math.random() * 4,
+      color: ['#FFD700', '#FFF', '#FFE44D', '#FFFACD'][Math.floor(Math.random() * 4)],
+    });
+  }
+}
+
+function spawnImpact(x, y) {
+  for (let i = 0; i < 8; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 4;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 1,
+      life: 1,
+      size: 2 + Math.random() * 3,
+      color: '#FFF',
+    });
+  }
+}
+
+function addFloatingText(x, y, text, color = '#FFF', size = 28) {
+  floatingTexts.push({ x, y, text, color, size, life: 1, vy: -2 });
+}
+
+function getDamage() {
+  if (combo === 0) return 2;
+  return 1;
+}
+
+function getWindowDuration() {
+  return Math.max(MIN_WINDOW, BASE_WINDOW - combo * WINDOW_DECREASE);
+}
+
+function startGame() {
+  state = STATE.IDLE;
+  mario = { x: MARIO_START_X, y: STAGE_FLOOR_Y, sprite: 'idle', scaleX: -1 };
+  goomba = { x: GOOMBA_X, y: STAGE_FLOOR_Y, squish: 0, hp: 999, flash: 0 };
+  combo = 0;
+  totalDamage = 0;
+  particles = [];
+  floatingTexts = [];
+  starSparkles = [];
+  screenShake = { x: 0, y: 0, intensity: 0 };
+  stateTimer = 0;
+  sfxStart();
+}
+
+function update(dt) {
+  stateTimer += dt;
+  titleBounce += dt * 3;
+
+  particles = particles.filter(p => {
+    p.x += p.vx; p.y += p.vy; p.vy += 0.15; p.life -= dt * 2;
+    return p.life > 0;
+  });
+
+  starSparkles = starSparkles.filter(s => {
+    s.x += s.vx; s.y += s.vy; s.vy += 0.05; s.life -= dt * 1.5;
+    return s.life > 0;
+  });
+
+  floatingTexts = floatingTexts.filter(f => {
+    f.y += f.vy; f.vy *= 0.97; f.life -= dt * 0.8;
+    return f.life > 0;
+  });
+
+  if (screenShake.intensity > 0) {
+    screenShake.intensity *= 0.85;
+    screenShake.x = (Math.random() - 0.5) * screenShake.intensity;
+    screenShake.y = (Math.random() - 0.5) * screenShake.intensity;
+    if (screenShake.intensity < 0.3) {
+      screenShake.x = 0; screenShake.y = 0; screenShake.intensity = 0;
+    }
+  }
+
+  if (goomba.squish > 0) goomba.squish *= 0.92;
+  if (goomba.flash > 0) goomba.flash -= dt * 4;
+
+  switch (state) {
+    case STATE.TITLE:
+      if (inputJustPressed) startGame();
+      break;
+
+    case STATE.IDLE:
+      mario.sprite = 'idle';
+      mario.scaleX = -1;
+      if (inputJustPressed) {
+        state = STATE.RUN_TO_ENEMY;
+        stateTimer = 0;
+        mario.sprite = 'run';
+        sfxJump();
+      }
+      break;
+
+    case STATE.RUN_TO_ENEMY: {
+      mario.sprite = 'run';
+      mario.scaleX = -1;
+      const targetX = goomba.x - 60;
+      const runSpeed = 6;
+      mario.x += runSpeed;
+      if (mario.x >= targetX) {
+        mario.x = targetX;
+        state = STATE.JUMP_UP;
+        stateTimer = 0;
+        jumpVelY = -12;
+        jumpVelX = 1.5;
+        mario.sprite = 'jump';
+        sfxJump();
+      }
+      break;
+    }
+
+    case STATE.JUMP_UP:
+      mario.sprite = 'jump';
+      mario.y += jumpVelY;
+      mario.x += jumpVelX;
+      jumpVelY += 0.5;
+      if (jumpVelY >= 0) {
+        state = STATE.FALL_TO_STOMP;
+        stateTimer = 0;
+      }
+      break;
+
+    case STATE.FALL_TO_STOMP: {
+      mario.sprite = 'jump';
+      mario.y += jumpVelY;
+      mario.x += jumpVelX * 0.5;
+      jumpVelY += 0.6;
+
+      const stompY = goomba.y - 45;
+      if (!ringActive && mario.y > stompY - 100) {
+        ringActive = true;
+        ringProgress = 0;
+        actionWindowStart = performance.now();
+        actionWindowDuration = getWindowDuration();
+        actionPressed = false;
+        actionResult = '';
+      }
+
+      if (ringActive) {
+        const elapsed = performance.now() - actionWindowStart;
+        ringProgress = Math.min(1, elapsed / actionWindowDuration);
+
+        if (inputJustPressed && !actionPressed) {
+          actionPressed = true;
+          const accuracy = ringProgress;
+          if (accuracy >= 0.70 && accuracy <= 1.0) {
+            actionResult = accuracy >= 0.80 && accuracy <= 0.95 ? 'nice' : 'good';
+          } else {
+            actionResult = 'miss';
+          }
+        }
+
+        if (ringProgress >= 1 && !actionPressed) {
+          actionResult = 'miss';
+          actionPressed = true;
+        }
+      }
+
+      if (mario.y >= stompY) {
+        mario.y = stompY;
+        ringActive = false;
+
+        if (actionResult === 'nice' || actionResult === 'good') {
+          state = STATE.STOMP_HIT;
+        } else {
+          state = STATE.MISS_BOUNCE;
+        }
+        stateTimer = 0;
+      }
+      break;
+    }
+
+    case STATE.STOMP_HIT: {
+      mario.sprite = 'jump';
+      const dmg = getDamage();
+      totalDamage += dmg;
+      combo++;
+
+      goomba.squish = 1;
+      goomba.flash = 1;
+      screenShake.intensity = 8;
+      sfxHit();
+      spawnImpact(goomba.x, goomba.y - 30);
+      spawnStars(goomba.x, goomba.y - 50, combo > 3 ? 8 : 5);
+
+      addFloatingText(goomba.x + (Math.random() - 0.5) * 30, goomba.y - 70, `${dmg}`, '#FFD700', 32);
+
+      if (actionResult === 'nice') {
+        addFloatingText(goomba.x + 40, goomba.y - 100, 'NICE!', '#3DF53D', 24);
+        sfxNice();
+      } else {
+        addFloatingText(goomba.x + 40, goomba.y - 100, 'GOOD!', '#5BC8F5', 22);
+      }
+
+      if (combo > 1) {
+        addFloatingText(goomba.x - 50, goomba.y - 110, `${combo}x`, '#FFF', 20);
+      }
+
+      state = STATE.BOUNCE_UP;
+      stateTimer = 0;
+      jumpVelY = -9 - Math.min(combo * 0.3, 3);
+      jumpVelX = 0;
+      mario.x = goomba.x - 5;
+      sfxBounce();
+      break;
+    }
+
+    case STATE.BOUNCE_UP:
+      mario.sprite = 'jump';
+      mario.y += jumpVelY;
+      jumpVelY += 0.45;
+      if (jumpVelY >= 0) {
+        state = STATE.BOUNCE_FALL;
+        stateTimer = 0;
+        ringActive = false;
+        ringProgress = 0;
+        actionPressed = false;
+        actionResult = '';
+      }
+      break;
+
+    case STATE.BOUNCE_FALL: {
+      mario.sprite = 'jump';
+      mario.y += jumpVelY;
+      jumpVelY += 0.55;
+
+      const stompY = goomba.y - 45;
+      if (!ringActive && mario.y > stompY - 110) {
+        ringActive = true;
+        ringProgress = 0;
+        actionWindowStart = performance.now();
+        actionWindowDuration = getWindowDuration();
+        actionPressed = false;
+        actionResult = '';
+      }
+
+      if (ringActive) {
+        const elapsed = performance.now() - actionWindowStart;
+        ringProgress = Math.min(1, elapsed / actionWindowDuration);
+
+        if (inputJustPressed && !actionPressed) {
+          actionPressed = true;
+          const accuracy = ringProgress;
+          if (accuracy >= 0.70 && accuracy <= 1.0) {
+            actionResult = accuracy >= 0.80 && accuracy <= 0.95 ? 'nice' : 'good';
+          } else {
+            actionResult = 'miss';
+          }
+        }
+
+        if (ringProgress >= 1 && !actionPressed) {
+          actionResult = 'miss';
+          actionPressed = true;
+        }
+      }
+
+      if (mario.y >= stompY) {
+        mario.y = stompY;
+        ringActive = false;
+
+        if (actionResult === 'nice' || actionResult === 'good') {
+          state = STATE.STOMP_HIT;
+        } else {
+          state = STATE.MISS_BOUNCE;
+        }
+        stateTimer = 0;
+      }
+      break;
+    }
+
+    case STATE.MISS_BOUNCE:
+      mario.sprite = 'jump';
+      sfxMiss();
+      addFloatingText(goomba.x, goomba.y - 80, 'MISS', '#FF4444', 28);
+      jumpVelY = -5;
+      jumpVelX = -3;
+      state = STATE.MISS_FALL;
+      stateTimer = 0;
+      goomba.squish = 0.3;
+      screenShake.intensity = 3;
+      break;
+
+    case STATE.MISS_FALL:
+      mario.sprite = 'jump';
+      mario.y += jumpVelY;
+      mario.x += jumpVelX;
+      jumpVelY += 0.6;
+      jumpVelX *= 0.98;
+
+      if (mario.y >= STAGE_FLOOR_Y) {
+        mario.y = STAGE_FLOOR_Y;
+        mario.sprite = 'idle';
+        state = STATE.RESULTS;
+        stateTimer = 0;
+      }
+      break;
+
+    case STATE.RESULTS:
+      mario.sprite = 'idle';
+      if (stateTimer > 1.5 && inputJustPressed) {
+        state = STATE.TITLE;
+        stateTimer = 0;
+        mario.x = MARIO_START_X;
+      }
+      break;
+  }
+
+  resetInput();
+}
+
+function getMarioSprite(name) {
+  const s = MARIO_SPRITES[name];
+  return extractSprite(assets.mario, s.x, s.y, s.w, s.h, isMagenta);
+}
+
+function getGoombaSprite() {
+  const s = GOOMBA_SPRITE;
+  return extractSprite(assets.goomba, s.x, s.y, s.w, s.h, isBlue);
+}
+
+function drawSprite(sprite, x, y, scale, flipX = false, squishY = 0) {
+  ctx.save();
+  ctx.translate(x, y);
+  if (flipX) ctx.scale(-1, 1);
+
+  const sw = sprite.width * scale;
+  const sh = sprite.height * scale;
+  const squishAmount = squishY * 0.3;
+
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(sprite,
+    -sw / 2,
+    -sh + (sh * squishAmount),
+    sw,
+    sh * (1 - squishAmount)
+  );
+  ctx.restore();
+}
+
+function drawStrokedText(text, x, y, color, size, strokeColor = '#000', strokeWidth = 4) {
+  ctx.font = `${size}px 'Luckiest Guy', Impact, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = strokeWidth;
+  ctx.strokeStyle = strokeColor;
+  ctx.fillStyle = color;
+  ctx.strokeText(text, x, y);
+  ctx.fillText(text, x, y);
+}
+
+function drawActionRing(x, y) {
+  if (!ringActive) return;
+
+  const outerR = 40;
+  const innerR = 14;
+  const currentR = outerR - (outerR - innerR) * ringProgress;
+
+  ctx.beginPath();
+  ctx.arc(x, y, innerR + 2, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  const inZone = ringProgress >= 0.70 && ringProgress <= 0.95;
+  const ringColor = inZone ? '#3DF53D' : (ringProgress > 0.95 ? '#FF4444' : '#FFD700');
+
+  ctx.beginPath();
+  ctx.arc(x, y, currentR, 0, Math.PI * 2);
+  ctx.strokeStyle = ringColor;
+  ctx.lineWidth = 4;
+  ctx.stroke();
+
+  if (inZone) {
+    ctx.beginPath();
+    ctx.arc(x, y, currentR, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(61, 245, 61, 0.3)';
+    ctx.lineWidth = 10;
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.globalAlpha = 0.6 + Math.sin(performance.now() * 0.01) * 0.3;
+  drawStrokedText('A', x, y - outerR - 16, '#FFF', 16, '#000', 3);
+  ctx.restore();
+}
+
+function drawStar(x, y, r, points = 4) {
+  ctx.beginPath();
+  for (let i = 0; i < points * 2; i++) {
+    const angle = (Math.PI / points) * i - Math.PI / 2;
+    const radius = i % 2 === 0 ? r : r * 0.4;
+    const px = x + Math.cos(angle) * radius;
+    const py = y + Math.sin(angle) * radius;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+function draw() {
+  ctx.save();
+  ctx.translate(screenShake.x, screenShake.y);
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(assets.theatre, 0, 0, GW, GH);
+  ctx.imageSmoothingEnabled = false;
+
+  if (state === STATE.TITLE) {
+    const gs = getGoombaSprite();
+    drawSprite(gs, GOOMBA_X, STAGE_FLOOR_Y, GOOMBA_SCALE);
+
+    const ms = getMarioSprite('idle');
+    drawSprite(ms, MARIO_START_X, STAGE_FLOOR_Y, MARIO_SCALE, true);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(0, 0, GW, GH);
+
+    const badgeY = 150 + Math.sin(titleBounce) * 8;
+    const badgeSize = 80;
+    ctx.drawImage(assets.badge, GW/2 - badgeSize/2, badgeY - badgeSize/2, badgeSize, badgeSize);
+
+    drawStrokedText('POWER BOUNCE', GW/2, badgeY + 65, '#FFD700', 42, '#5C2D00', 5);
+    drawStrokedText('Action Command', GW/2, badgeY + 100, '#FFF', 22, '#333', 3);
+
+    const alpha = 0.5 + Math.sin(performance.now() * 0.004) * 0.5;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    drawStrokedText('Press A or SPACE to start', GW/2, badgeY + 160, '#FFF', 20, '#000', 3);
+    ctx.restore();
+
+    drawStrokedText('Time your press when the ring aligns!', GW/2, GH - 50, '#CCC', 14, '#000', 2);
+
+  } else {
+    const gs = getGoombaSprite();
+    if (goomba.flash > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.5 + goomba.flash * 0.5;
+    }
+    drawSprite(gs, goomba.x, goomba.y, GOOMBA_SCALE, false, goomba.squish);
+    if (goomba.flash > 0) ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = 0.2;
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.ellipse(goomba.x, STAGE_FLOOR_Y + 2, 25, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = 0.2;
+    ctx.fillStyle = '#000';
+    const shadowY = STAGE_FLOOR_Y + 2;
+    const shadowScale = Math.max(0.3, 1 - (STAGE_FLOOR_Y - mario.y) / 300);
+    ctx.beginPath();
+    ctx.ellipse(mario.x, shadowY, 22 * shadowScale, 5 * shadowScale, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    const ms = getMarioSprite(mario.sprite);
+    drawSprite(ms, mario.x, mario.y, MARIO_SCALE, mario.scaleX < 0);
+
+    if (ringActive) {
+      drawActionRing(goomba.x, goomba.y - 40);
+    }
+
+    particles.forEach(p => {
+      ctx.save();
+      ctx.globalAlpha = p.life;
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+      ctx.restore();
+    });
+
+    starSparkles.forEach(s => {
+      ctx.save();
+      ctx.globalAlpha = s.life;
+      ctx.fillStyle = s.color;
+      drawStar(s.x, s.y, s.size);
+      ctx.restore();
+    });
+
+    floatingTexts.forEach(f => {
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, f.life * 2);
+      drawStrokedText(f.text, f.x, f.y, f.color, f.size);
+      ctx.restore();
+    });
+
+    if (combo > 0 && state !== STATE.RESULTS) {
+      const hudX = 60;
+      const hudY = 55;
+
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.beginPath();
+      ctx.roundRect(hudX - 50, hudY - 28, 100, 56, 10);
+      ctx.fill();
+      ctx.strokeStyle = '#FFD700';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      drawStrokedText(`${combo}`, hudX, hudY - 8, '#FFD700', 28, '#000', 3);
+      drawStrokedText('HITS', hudX, hudY + 16, '#FFF', 12, '#000', 2);
+    }
+
+    if (combo > 0 && state !== STATE.RESULTS) {
+      const dmgX = GW - 70;
+      const dmgY = 55;
+
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.beginPath();
+      ctx.roundRect(dmgX - 50, dmgY - 28, 100, 56, 10);
+      ctx.fill();
+      ctx.strokeStyle = '#FF6B6B';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      drawStrokedText(`${totalDamage}`, dmgX, dmgY - 8, '#FF6B6B', 28, '#000', 3);
+      drawStrokedText('DMG', dmgX, dmgY + 16, '#FFF', 12, '#000', 2);
+    }
+
+    if (ringActive) {
+      const barW = 120;
+      const barH = 8;
+      const barX = GW/2 - barW/2;
+      const barY = 30;
+      const windowPct = getWindowDuration() / BASE_WINDOW;
+
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(barX - 2, barY - 2, barW + 4, barH + 4);
+
+      const gradient = ctx.createLinearGradient(barX, 0, barX + barW * windowPct, 0);
+      gradient.addColorStop(0, '#3DF53D');
+      gradient.addColorStop(0.5, '#FFD700');
+      gradient.addColorStop(1, '#FF4444');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(barX, barY, barW * windowPct, barH);
+
+      drawStrokedText('TIMING', GW/2, barY + 22, '#FFF', 11, '#000', 2);
+    }
+
+    if (state === STATE.RESULTS) {
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(0, 0, GW, GH);
+
+      const centerY = GH / 2 - 20;
+
+      ctx.fillStyle = 'rgba(20, 10, 50, 0.85)';
+      ctx.strokeStyle = '#FFD700';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.roundRect(GW/2 - 160, centerY - 80, 320, 180, 16);
+      ctx.fill();
+      ctx.stroke();
+
+      drawStrokedText('RESULTS', GW/2, centerY - 55, '#FFD700', 30, '#5C2D00', 4);
+
+      drawStrokedText(`Hits: ${combo}`, GW/2, centerY - 15, '#FFF', 24, '#000', 3);
+      drawStrokedText(`Total Damage: ${totalDamage}`, GW/2, centerY + 20, '#FF6B6B', 24, '#000', 3);
+
+      let rating = 'Keep Trying!';
+      let ratingColor = '#AAA';
+      if (combo >= 10) { rating = 'SUPERSTAR!'; ratingColor = '#FFD700'; }
+      else if (combo >= 7) { rating = 'GREAT!'; ratingColor = '#3DF53D'; }
+      else if (combo >= 4) { rating = 'Good!'; ratingColor = '#5BC8F5'; }
+      else if (combo >= 2) { rating = 'OK'; ratingColor = '#FFA500'; }
+
+      drawStrokedText(rating, GW/2, centerY + 55, ratingColor, 22, '#000', 3);
+
+      if (stateTimer > 1.5) {
+        const alpha = 0.5 + Math.sin(performance.now() * 0.004) * 0.5;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        drawStrokedText('Press A or SPACE to retry', GW/2, centerY + 120, '#FFF', 16, '#000', 2);
+        ctx.restore();
+      }
+    }
+
+    if (state === STATE.IDLE) {
+      const alpha = 0.5 + Math.sin(performance.now() * 0.005) * 0.5;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      drawStrokedText('Press A or SPACE to attack!', GW/2, 80, '#FFF', 22, '#000', 3);
+      ctx.restore();
+    }
+  }
+
+  ctx.restore();
+}
+
+function resize() {
+  const aspect = GW / GH;
+  const winAspect = window.innerWidth / window.innerHeight;
+  let w, h;
+  if (winAspect > aspect) {
+    w = window.innerWidth;
+    h = w / aspect;
+  } else {
+    h = window.innerHeight;
+    w = h * aspect;
+  }
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+}
+window.addEventListener('resize', resize);
+
+let lastTime = 0;
+
+function gameLoop(timestamp) {
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+  lastTime = timestamp;
+
+  update(dt);
+  draw();
+
+  requestAnimationFrame(gameLoop);
+}
+
+loadAssets(() => {
+  resize();
+  requestAnimationFrame(gameLoop);
+});
